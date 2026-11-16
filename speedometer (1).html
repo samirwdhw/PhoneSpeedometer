@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d10">
+<title>GPS Speedometer</title>
+<style>
+  :root { --bg:#0b0d10; --fg:#e8eaed; --dim:#8a9099; --acc:#4ade80; --warn:#fbbf24; --bad:#f87171; --card:#151920; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; -webkit-user-select:none; user-select:none; }
+  body { display:flex; flex-direction:column; padding:calc(env(safe-area-inset-top) + 12px) 16px calc(env(safe-area-inset-bottom) + 16px); gap:14px; }
+  header { display:flex; justify-content:space-between; align-items:center; }
+  .status { font-size:13px; color:var(--dim); display:flex; align-items:center; gap:6px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--dim); }
+  .dot.ok { background:var(--acc); } .dot.meh { background:var(--warn); } .dot.bad { background:var(--bad); }
+  .unit-toggle { background:var(--card); border:1px solid #262c36; color:var(--fg); border-radius:999px; padding:6px 14px; font-size:14px; }
+  .main { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:200px; }
+  #speed { font-size:min(38vw,220px); font-weight:700; line-height:.9; font-variant-numeric:tabular-nums; letter-spacing:-.03em; }
+  #unit { font-size:22px; color:var(--dim); margin-top:6px; }
+  #src { font-size:12px; color:var(--dim); margin-top:6px; min-height:1em; }
+  .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+  .stat { background:var(--card); border-radius:14px; padding:12px 14px; }
+  .stat .k { font-size:12px; color:var(--dim); text-transform:uppercase; letter-spacing:.06em; }
+  .stat .v { font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; margin-top:2px; }
+  .stat .v small { font-size:14px; color:var(--dim); font-weight:400; margin-left:3px; }
+  canvas { width:100%; height:90px; background:var(--card); border-radius:14px; display:block; }
+  .buttons { display:flex; gap:10px; }
+  button.big { flex:1; font-size:18px; font-weight:600; padding:16px; border-radius:14px; border:none; }
+  #startBtn { background:var(--acc); color:#06230f; }
+  #startBtn.stop { background:var(--bad); color:#2a0606; }
+  #resetBtn { background:var(--card); color:var(--fg); border:1px solid #262c36; flex:0 0 32%; }
+  #msg { font-size:13px; color:var(--warn); text-align:center; min-height:1em; }
+</style>
+</head>
+<body>
+<header>
+  <div class="status"><span class="dot" id="dot"></span><span id="statusText">Not started</span></div>
+  <button class="unit-toggle" id="unitBtn">mph</button>
+</header>
+
+<div class="main">
+  <div id="speed">--</div>
+  <div id="unit">mph</div>
+  <div id="src"></div>
+</div>
+
+<canvas id="chart"></canvas>
+
+<div class="grid">
+  <div class="stat"><div class="k">Max</div><div class="v" id="max">0<small class="u">mph</small></div></div>
+  <div class="stat"><div class="k">Avg (moving)</div><div class="v" id="avg">0<small class="u">mph</small></div></div>
+  <div class="stat"><div class="k">Distance</div><div class="v" id="dist">0.00<small class="du">mi</small></div></div>
+  <div class="stat"><div class="k">Moving time</div><div class="v" id="time">0:00</div></div>
+</div>
+
+<div id="msg"></div>
+<button class="big" id="permBtn" style="background:#2563eb;color:#fff;width:100%">Grant location permission</button>
+<div class="buttons">
+  <button class="big" id="startBtn">Start</button>
+  <button class="big" id="resetBtn">Reset</button>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const UNITS = {
+    mph: { f: 2.236936, d: 1/1609.344, dl: 'mi' },
+    'km/h': { f: 3.6, d: 1/1000, dl: 'km' }
+  };
+  let unit = 'mph';
+  try { unit = localStorage.getItem('spd_unit') || 'mph'; } catch (e) {}
+
+  const MAX_ACC = 35;          // m — ignore fixes worse than this for distance/avg
+  const MOVING = 0.6;          // m/s (~1.3 mph) — below this counts as stopped
+  const HISTORY_SEC = 120;
+
+  let watchId = null, wakeLock = null;
+  let last = null;             // last accepted fix {lat, lon, t}
+  let curMs = 0, maxMs = 0, distM = 0, movingSec = 0;
+  let smooth = null;
+  let history = [];            // {t, v}
+  let lastFixAt = 0;
+
+  function haversine(a, b) {
+    const R = 6371000, r = Math.PI / 180;
+    const dLat = (b.lat - a.lat) * r, dLon = (b.lon - a.lon) * r;
+    const s = Math.sin(dLat/2)**2 + Math.cos(a.lat*r) * Math.cos(b.lat*r) * Math.sin(dLon/2)**2;
+    return 2 * R * Math.asin(Math.sqrt(s));
+  }
+
+  function fmtTime(s) {
+    s = Math.floor(s);
+    const h = Math.floor(s/3600), m = Math.floor(s%3600/60), sec = s%60;
+    return h ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${m}:${String(sec).padStart(2,'0')}`;
+  }
+
+  function render() {
+    const u = UNITS[unit];
+    $('speed').textContent = watchId === null && !last ? '--' : (curMs * u.f).toFixed(curMs * u.f < 10 ? 1 : 0);
+    $('unit').textContent = unit;
+    $('unitBtn').textContent = unit;
+    document.querySelectorAll('.u').forEach(e => e.textContent = unit);
+    document.querySelectorAll('.du').forEach(e => e.textContent = u.dl);
+    $('max').firstChild.nodeValue = (maxMs * u.f).toFixed(1);
+    const avg = movingSec > 0 ? distM / movingSec : 0;
+    $('avg').firstChild.nodeValue = (avg * u.f).toFixed(1);
+    $('dist').firstChild.nodeValue = (distM * u.d).toFixed(2);
+    $('time').textContent = fmtTime(movingSec);
+    drawChart();
+  }
+
+  function drawChart() {
+    const c = $('chart'), dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth, h = c.clientHeight;
+    if (c.width !== w*dpr) { c.width = w*dpr; c.height = h*dpr; }
+    const g = c.getContext('2d');
+    g.setTransform(dpr,0,0,dpr,0,0);
+    g.clearRect(0,0,w,h);
+    const now = performance.now() / 1000;
+    const pts = history.filter(p => now - p.t <= HISTORY_SEC);
+    const f = UNITS[unit].f;
+    const top = Math.max(5, ...pts.map(p => p.v * f)) * 1.15;
+    g.fillStyle = '#8a9099'; g.font = '11px -apple-system,sans-serif';
+    g.fillText(`${top.toFixed(0)} ${unit}`, 8, 14);
+    g.fillText('last 2 min', w - 62, h - 8);
+    if (pts.length < 2) return;
+    g.beginPath();
+    pts.forEach((p, i) => {
+      const x = w - (now - p.t) / HISTORY_SEC * w;
+      const y = h - 6 - (p.v * f / top) * (h - 20);
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    });
+    g.strokeStyle = '#4ade80'; g.lineWidth = 2; g.lineJoin = 'round'; g.stroke();
+  }
+
+  function setStatus(text, cls) {
+    $('statusText').textContent = text;
+    $('dot').className = 'dot' + (cls ? ' ' + cls : '');
+  }
+
+  function onFix(pos) {
+    const { latitude: lat, longitude: lon, accuracy: acc, speed } = pos.coords;
+    const t = pos.timestamp / 1000;
+    lastFixAt = performance.now();
+    setStatus(`GPS ±${Math.round(acc)} m`, acc <= 10 ? 'ok' : acc <= MAX_ACC ? 'meh' : 'bad');
+    $('msg').textContent = '';
+
+    const fix = { lat, lon, t };
+    let v = null, source = '';
+
+    if (last && acc <= MAX_ACC) {
+      const dt = t - last.t;
+      if (dt > 0) {
+        const d = haversine(last, fix);
+        const derived = d / dt;
+        if (speed != null && !isNaN(speed) && speed >= 0) { v = speed; source = 'GPS Doppler speed'; }
+        else { v = derived; source = 'computed from position'; }
+        // reject obvious teleports (>90 m/s ≈ 200 mph)
+        if (derived < 90) {
+          if (v >= MOVING) { distM += d; movingSec += dt; }
+          last = fix;
+        }
+      }
+    } else if (acc <= MAX_ACC) {
+      last = fix;
+      if (speed != null && !isNaN(speed) && speed >= 0) { v = speed; source = 'GPS Doppler speed'; }
+    } else {
+      source = 'waiting for better GPS accuracy…';
+    }
+
+    if (v != null) {
+      smooth = smooth == null ? v : smooth * 0.4 + v * 0.6;
+      curMs = smooth < 0.3 ? 0 : smooth;
+      if (acc <= MAX_ACC) maxMs = Math.max(maxMs, curMs);
+      history.push({ t: performance.now() / 1000, v: curMs });
+      if (history.length > 2000) history = history.slice(-1000);
+    }
+    $('src').textContent = source;
+    render();
+  }
+
+  function onErr(err) {
+    const m = { 1: 'Location permission denied. Enable it for this site in your browser settings.',
+                2: 'Position unavailable — try going outside with a clear view of the sky.',
+                3: 'GPS timed out, still trying…' };
+    $('msg').textContent = m[err.code] || err.message;
+    setStatus('No fix', 'bad');
+    if (err.code === 1) stop();
+  }
+
+  async function keepAwake() {
+    try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+
+  function start() {
+    if (!('geolocation' in navigator)) { $('msg').textContent = 'This browser has no geolocation.'; return; }
+    if (!window.isSecureContext) { $('msg').textContent = 'Location needs an https:// page. See notes on hosting.'; }
+    setStatus('Acquiring GPS…', 'meh');
+    watchId = navigator.geolocation.watchPosition(onFix, onErr, { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+    $('startBtn').textContent = 'Stop'; $('startBtn').classList.add('stop');
+    keepAwake();
+  }
+
+  function stop() {
+    if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+    watchId = null;
+    if (wakeLock) { wakeLock.release().catch(()=>{}); wakeLock = null; }
+    $('startBtn').textContent = 'Start'; $('startBtn').classList.remove('stop');
+    setStatus('Paused');
+    curMs = 0; smooth = null; last = null;
+    render();
+  }
+
+  // --- Permission button ---
+  function showPerm(state) {
+    const b = $('permBtn');
+    if (state === 'granted') { b.style.display = 'none'; return; }
+    b.style.display = '';
+    b.textContent = state === 'denied' ? 'Location blocked — tap for help' : 'Grant location permission';
+  }
+  async function checkPerm() {
+    try {
+      const p = await navigator.permissions.query({ name: 'geolocation' });
+      showPerm(p.state);
+      p.onchange = () => showPerm(p.state);
+    } catch (e) { showPerm('prompt'); }  // Permissions API missing (older Safari)
+  }
+  $('permBtn').onclick = () => {
+    if (!('geolocation' in navigator)) { $('msg').textContent = 'This browser has no geolocation.'; return; }
+    if (!window.isSecureContext) {
+      $('msg').textContent = 'Browsers only allow location on https:// pages. Host this file (e.g. Netlify Drop) and open that link.';
+      return;
+    }
+    $('msg').textContent = 'Asking for permission…';
+    navigator.geolocation.getCurrentPosition(
+      pos => { $('msg').textContent = `Location granted (±${Math.round(pos.coords.accuracy)} m). Tap Start.`; showPerm('granted'); },
+      err => {
+        if (err.code === 1) {
+          showPerm('denied');
+          $('msg').textContent = /iPhone|iPad/.test(navigator.userAgent)
+            ? 'Blocked. Tap "aA" in the address bar → Website Settings → Location → Allow, and check Settings → Privacy → Location Services → Safari Websites.'
+            : 'Blocked. Tap the icon left of the URL → Permissions → Location → Allow, and check Chrome has location in Android app settings.';
+        } else {
+          $('msg').textContent = 'Permission OK but no fix yet — try outdoors. Tap Start.';
+          showPerm('granted');
+        }
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+    );
+  };
+  checkPerm();
+
+  $('startBtn').onclick = () => watchId === null ? start() : stop();
+  $('resetBtn').onclick = () => { maxMs = distM = movingSec = 0; history = []; render(); };
+  $('unitBtn').onclick = () => {
+    unit = unit === 'mph' ? 'km/h' : 'mph';
+    try { localStorage.setItem('spd_unit', unit); } catch (e) {}
+    render();
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && watchId !== null) keepAwake();
+  });
+  // Decay displayed speed if fixes stop arriving
+  setInterval(() => {
+    if (watchId !== null && performance.now() - lastFixAt > 5000 && lastFixAt) {
+      curMs = 0; $('src').textContent = 'no recent GPS fix'; render();
+    } else drawChart();
+  }, 1000);
+  window.addEventListener('resize', drawChart);
+  render();
+})();
+</script>
+</body>
+</html>
